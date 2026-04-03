@@ -1,0 +1,13 @@
+{
+  "domain": "zephyr_hood",
+  "name": "Zephyr Hood",
+  "version": "0.1.0",
+  "documentation": "https://github.com/Cows2Computers/zephyr-connect-ha",
+  "issue_tracker": "https://github.com/Cows2Computers/zephyr-connect-ha/issues",
+  "dependencies": [],
+  "codeowners": ["@Cows2Computers"],
+  "requirements": ["aiohttp>=3.8.0"],
+  "iot_class": "cloud_polling",
+  "config_flow": true,
+  "homeassistant": "2024.1.0"
+}

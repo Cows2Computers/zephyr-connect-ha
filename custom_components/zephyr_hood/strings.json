@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Zephyr Hood",
+        "description": "Enter your Zephyr Connect app credentials",
+        "data": {
+          "email": "Email Address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Cannot connect to Zephyr cloud",
+      "unknown": "Unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "Zephyr Hood is already configured"
+    }
+  }
+}
