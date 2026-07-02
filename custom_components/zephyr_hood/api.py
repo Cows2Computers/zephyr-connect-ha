@@ -40,6 +40,13 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# paho logs every PUBLISH/PINGREQ/PINGRESP at DEBUG, which drowns out HA's own
+# debug log for this integration. Keep it quiet unless explicitly re-enabled.
+logging.getLogger("paho").setLevel(logging.WARNING)
+
+_RECONNECT_MIN_DELAY = 1
+_RECONNECT_MAX_DELAY = 60
+
 
 class ZephyrAuthError(Exception):
     """Raised on Cognito authentication failure (bad credentials)."""
@@ -49,24 +56,35 @@ class ZephyrApiError(Exception):
     """Raised on any other cloud/API failure."""
 
 
-def build_ssl_context() -> ssl.SSLContext:
-    """Verifying SSL context for the Zephyr/Gemtek + AWS endpoints.
-
-    Two quirks are handled:
-
-    * CA trust: on Home Assistant OS the system CA store does not verify the
-      Gemtek API chain, even though Cognito (via botocore's bundled certifi
-      store) does. We anchor to certifi so behaviour matches everywhere.
-    * Strict X.509: the Gemtek cert is missing the Subject Key Identifier
-      extension, which Python 3.13's strict mode rejects. We keep full chain +
-      hostname verification but drop only the strict RFC checks.
-    """
+def _build_certifi_context() -> ssl.SSLContext:
     try:
         import certifi
 
-        ctx = ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context(cafile=certifi.where())
     except Exception:  # noqa: BLE001 - fall back to the system store
-        ctx = ssl.create_default_context()
+        return ssl.create_default_context()
+
+
+def build_aws_ssl_context() -> ssl.SSLContext:
+    """Verifying SSL context for AWS endpoints (Cognito Identity, IoT Core).
+
+    On Home Assistant OS the system CA store does not verify these chains, even
+    though botocore's bundled certifi store does, so we anchor to certifi to
+    match behaviour everywhere. AWS's own certs pass strict X.509 checks, so
+    unlike the Gemtek context below we leave strict mode enabled.
+    """
+    return _build_certifi_context()
+
+
+def build_gemtek_ssl_context() -> ssl.SSLContext:
+    """Verifying SSL context for the Gemtek app API.
+
+    Same CA anchoring as `build_aws_ssl_context`, plus one extra quirk: the
+    Gemtek cert is missing the Subject Key Identifier extension, which Python
+    3.13's strict mode rejects. We keep full chain + hostname verification but
+    drop only the strict RFC checks.
+    """
+    ctx = _build_certifi_context()
     if hasattr(ssl, "VERIFY_X509_STRICT"):
         ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
     return ctx
@@ -75,26 +93,80 @@ def build_ssl_context() -> ssl.SSLContext:
 class ZephyrCloud:
     """Synchronous Zephyr cloud client. Blocking calls run in HA's executor."""
 
-    def __init__(self, email: str, password: str) -> None:
+    def __init__(
+        self,
+        email: str,
+        password: str | None = None,
+        refresh_token: str | None = None,
+    ) -> None:
         self._email = email
         self._password = password
+        self._refresh_token = refresh_token
         self._cognito: Cognito | None = None
         self._lock = threading.Lock()
         self._client: mqtt.Client | None = None
         self._on_state: Callable[[str, dict[str, Any]], None] | None = None
         self._things: set[str] = set()
-        self._ssl: ssl.SSLContext | None = None
+        self._ssl_aws: ssl.SSLContext | None = None
+        self._ssl_gemtek: ssl.SSLContext | None = None
+        self._reconnect_delay = _RECONNECT_MIN_DELAY
+        self._closing = False
 
-    def _ctx(self) -> ssl.SSLContext:
-        """Lazily build the SSL context. Only called from executor threads so
-        the cert-file load never blocks the event loop."""
-        if self._ssl is None:
-            self._ssl = build_ssl_context()
-        return self._ssl
+    def _ctx_aws(self) -> ssl.SSLContext:
+        """Lazily build the AWS SSL context. Only called from executor threads
+        so the cert-file load never blocks the event loop."""
+        if self._ssl_aws is None:
+            self._ssl_aws = build_aws_ssl_context()
+        return self._ssl_aws
+
+    def _ctx_gemtek(self) -> ssl.SSLContext:
+        """Lazily build the Gemtek SSL context. Only called from executor
+        threads so the cert-file load never blocks the event loop."""
+        if self._ssl_gemtek is None:
+            self._ssl_gemtek = build_gemtek_ssl_context()
+        return self._ssl_gemtek
 
     # ----------------------------------------------------------------- auth ----
+    @property
+    def refresh_token(self) -> str | None:
+        """Current Cognito refresh token. Callers should persist this instead
+        of the account password once available."""
+        if self._cognito is not None:
+            return self._cognito.refresh_token
+        return self._refresh_token
+
     def authenticate(self) -> None:
-        """Sign in to the Cognito User Pool (SRP). Raises ZephyrAuthError."""
+        """Sign in to the Cognito User Pool. Raises ZephyrAuthError.
+
+        Prefers renewing from a stored refresh token (no password needed) and
+        only falls back to a full SRP password login when that's unavailable
+        or has expired.
+        """
+        if self._refresh_token:
+            cog = Cognito(
+                COGNITO_USER_POOL_ID,
+                COGNITO_APP_CLIENT_ID,
+                client_secret=COGNITO_APP_CLIENT_SECRET,
+                user_pool_region=AWS_REGION,
+                username=self._email,
+                refresh_token=self._refresh_token,
+            )
+            try:
+                cog.renew_access_token()
+            except Exception as err:  # noqa: BLE001 - refresh token expired/invalid
+                if not self._password:
+                    raise ZephyrAuthError(f"refresh token invalid: {err}") from err
+                _LOGGER.debug(
+                    "Zephyr refresh token renewal failed, falling back to password: %s",
+                    err,
+                )
+            else:
+                self._cognito = cog
+                return
+
+        if not self._password:
+            raise ZephyrAuthError("No refresh token or password available")
+
         cog = Cognito(
             COGNITO_USER_POOL_ID,
             COGNITO_APP_CLIENT_ID,
@@ -129,8 +201,18 @@ class ZephyrCloud:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20, context=self._ctx()) as resp:
-            return json.loads(resp.read())
+        try:
+            with urllib.request.urlopen(req, timeout=20, context=self._ctx_aws()) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as err:
+            body_text = ""
+            try:
+                body_text = err.read().decode(errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                pass
+            raise ZephyrApiError(f"{target} HTTP {err.code}: {body_text}") from err
+        except Exception as err:
+            raise ZephyrApiError(f"{target} failed: {type(err).__name__}: {err}") from err
 
     def _aws_credentials(self) -> dict[str, str]:
         """Exchange the Cognito IdToken for temporary AWS credentials."""
@@ -164,7 +246,7 @@ class ZephyrCloud:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=20, context=self._ctx()) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=self._ctx_gemtek()) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as err:
             body = ""
@@ -196,7 +278,7 @@ class ZephyrCloud:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=20, context=self._ctx()) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=self._ctx_gemtek()) as resp:
                 return json.loads(resp.read())
         except Exception as err:
             raise ZephyrApiError(
@@ -253,7 +335,7 @@ class ZephyrCloud:
             client_id="ha-zephyr-" + uuid.uuid4().hex[:10],
             transport="websockets",
         )
-        client.tls_set_context(self._ctx())
+        client.tls_set_context(self._ctx_aws())
         client.ws_set_options(path=self._signed_ws_path())
         client.on_connect = self._on_connect
         client.on_message = self._on_message
@@ -286,6 +368,7 @@ class ZephyrCloud:
         self._client.publish(f"$aws/things/{thing_name}/shadow/update", payload, qos=1)
 
     def disconnect(self) -> None:
+        self._closing = True
         if self._client:
             self._client.loop_stop()
             self._client.disconnect()
@@ -294,6 +377,7 @@ class ZephyrCloud:
     # ------------------------------------------------------ MQTT callbacks ----
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         _LOGGER.debug("Zephyr MQTT connected (%s)", reason_code)
+        self._reconnect_delay = _RECONNECT_MIN_DELAY
         for thing in list(self._things):
             self._subscribe(thing)
 
@@ -312,8 +396,18 @@ class ZephyrCloud:
             self._on_state(thing, reported)
 
     def _on_disconnect(self, client, userdata, *args) -> None:
-        # Credentials in the presigned URL expire; re-sign and reconnect.
-        _LOGGER.debug("Zephyr MQTT disconnected; re-signing and reconnecting")
+        if self._closing:
+            return
+        # Credentials in the presigned URL expire; re-sign and reconnect, backing
+        # off exponentially so a persistently unreachable broker doesn't spin.
+        delay = self._reconnect_delay
+        self._reconnect_delay = min(self._reconnect_delay * 2, _RECONNECT_MAX_DELAY)
+        _LOGGER.debug("Zephyr MQTT disconnected; reconnecting in %ss", delay)
+        threading.Timer(delay, self._reconnect, args=(client,)).start()
+
+    def _reconnect(self, client: mqtt.Client) -> None:
+        if self._closing:
+            return
         try:
             client.ws_set_options(path=self._signed_ws_path())
             client.reconnect()

@@ -10,6 +10,11 @@ dashboards, and voice assistants.
 State updates are **pushed** in real time over MQTT, so changes made from the
 wall control or the app show up in Home Assistant immediately (no polling).
 
+> **Note:** This is built and maintained for my own personal use with my own
+> hood. No extra work has gone into supporting other setups, models, or
+> configurations — it's made public in case it's useful to someone else, but
+> use it as-is and expect rough edges.
+
 ## Features
 
 | Platform | Entity | Notes |
@@ -59,15 +64,19 @@ runs cleanly on Home Assistant OS):
 The AWS identifiers in `const.py` (Cognito pool/client IDs, IoT endpoint) are the
 app's own public configuration — they are embedded in every copy of the Zephyr
 Connect app and are required for sign-in to work. They are **not** account
-secrets; you still authenticate with your personal email and password, which are
-stored only in your Home Assistant config entry.
+secrets; you still authenticate with your personal email and password. The
+password itself is only used once to sign in — what's actually stored in your
+Home Assistant config entry is your email and the Cognito refresh token issued
+at sign-in.
 
 ## Security & privacy
 
-- **Your credentials stay in your HA.** Your Zephyr email/password live in the
-  config entry (HA's encrypted `.storage`) and are sent only to Zephyr's own
-  Cognito sign-in — never to this project or any third party. No secrets
-  (credentials, tokens, or the signed MQTT URL) are written to the log.
+- **Your credentials stay in your HA.** Your Zephyr password is never stored —
+  only used once at sign-in. The config entry (HA's encrypted `.storage`) holds
+  your email and a Cognito refresh token instead, sent only to Zephyr's own
+  Cognito sign-in — never to this project or any third party. If the refresh
+  token expires, HA's reauth flow will prompt for your password again. No
+  secrets (credentials, tokens, or the signed MQTT URL) are written to the log.
 - **The `const.py` AWS IDs/secret are not yours.** They're the public app's own
   configuration, identical in every APK, required for Cognito `SECRET_HASH`
   sign-in. They identify the shared Zephyr backend, not an account.
@@ -87,13 +96,14 @@ guidance.
 
 ## Credits & acknowledgments
 
-This project began as a fork of
-[**Cows2Computers/zephyr-connect-ha**](https://github.com/Cows2Computers/zephyr-connect-ha)
-by Eric (Cows2Computers), which laid out the original integration scaffold and
-goal. The cloud backend (Cognito + AWS IoT Device Shadow) and the entity
-implementations in this release were built on top of that starting point. The
-original work is MIT-licensed and that copyright is retained in
-[LICENSE](LICENSE) — thank you for the head start.
+This repo started here with the original integration scaffold and goal.
+[**kyooknot**](https://github.com/kyooknot) forked it and implemented the
+cloud backend (Cognito + AWS IoT Device Shadow) and the full entity set, then
+sent that work back as
+[PR #1](https://github.com/Cows2Computers/zephyr-connect-ha/pull/1), which is
+merged in here — thank you for the heavy lifting. Contributors' copyright is
+retained in [LICENSE](LICENSE) alongside the original, under the same MIT
+terms.
 
 Community integration, not affiliated with or endorsed by Zephyr. Built by
 reverse-engineering the public app. Contributions welcome — please open an issue

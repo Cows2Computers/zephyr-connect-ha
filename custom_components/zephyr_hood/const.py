@@ -6,6 +6,7 @@ MANUFACTURER = "Zephyr"
 # Config entry keys
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
+CONF_REFRESH_TOKEN = "refresh_token"
 
 # --- Zephyr Connect cloud (AWS Amplify backend) ---------------------------------
 # These identifiers are *baked into the public Zephyr Connect Android app*

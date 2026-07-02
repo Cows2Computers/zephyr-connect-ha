@@ -8,6 +8,13 @@
           "email": "Email address",
           "password": "Password"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Zephyr Hood",
+        "description": "Your Zephyr Connect session for {email} has expired. Enter your password to reconnect.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {
@@ -17,7 +24,8 @@
       "unknown": "Unexpected error occurred"
     },
     "abort": {
-      "already_configured": "This Zephyr account is already configured"
+      "already_configured": "This Zephyr account is already configured",
+      "reauth_successful": "Reauthentication was successful"
     }
   }
 }

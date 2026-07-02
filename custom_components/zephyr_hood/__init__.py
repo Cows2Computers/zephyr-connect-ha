@@ -10,7 +10,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import ZephyrApiError, ZephyrAuthError, ZephyrCloud
-from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN, PLATFORMS
+from .const import CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_TOKEN, DOMAIN, PLATFORMS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +36,11 @@ class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Zephyr Hood from a config entry."""
-    cloud = ZephyrCloud(entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD])
+    cloud = ZephyrCloud(
+        entry.data[CONF_EMAIL],
+        password=entry.data.get(CONF_PASSWORD),
+        refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+    )
 
     try:
         await hass.async_add_executor_job(cloud.authenticate)
@@ -44,6 +48,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryAuthFailed(str(err)) from err
     except ZephyrApiError as err:
         raise ConfigEntryNotReady(str(err)) from err
+
+    # Once we have a working refresh token, persist that instead of the
+    # plaintext password (migrates existing entries that predate this).
+    if cloud.refresh_token and (
+        entry.data.get(CONF_REFRESH_TOKEN) != cloud.refresh_token
+        or CONF_PASSWORD in entry.data
+    ):
+        new_data = {k: v for k, v in entry.data.items() if k != CONF_PASSWORD}
+        new_data[CONF_REFRESH_TOKEN] = cloud.refresh_token
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
     try:
         devices = await hass.async_add_executor_job(cloud.get_devices)
