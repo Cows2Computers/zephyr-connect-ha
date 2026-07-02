@@ -11,6 +11,7 @@ Flow (all reverse-engineered + verified against a real ZVE hood):
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import hashlib
 import hmac
@@ -90,6 +91,21 @@ def build_gemtek_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _jwt_claim(token: str, claim: str) -> str | None:
+    """Read one claim out of a JWT's payload, without verifying its signature.
+
+    Used only to recover Cognito's internal `cognito:username` (a UUID-style
+    id, distinct from the email alias used to sign in) from a token we already
+    trust because we just received it directly from Cognito over TLS.
+    """
+    try:
+        payload = token.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded)).get(claim)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class ZephyrCloud:
     """Synchronous Zephyr cloud client. Blocking calls run in HA's executor."""
 
@@ -98,10 +114,12 @@ class ZephyrCloud:
         email: str,
         password: str | None = None,
         refresh_token: str | None = None,
+        cognito_username: str | None = None,
     ) -> None:
         self._email = email
         self._password = password
         self._refresh_token = refresh_token
+        self._cognito_username = cognito_username
         self._cognito: Cognito | None = None
         self._lock = threading.Lock()
         self._client: mqtt.Client | None = None
@@ -135,6 +153,19 @@ class ZephyrCloud:
             return self._cognito.refresh_token
         return self._refresh_token
 
+    @property
+    def cognito_username(self) -> str | None:
+        """Cognito's internal username (the `cognito:username` claim).
+
+        This is a UUID-style id assigned when the pool has email configured as
+        an alias rather than the primary username attribute — which is our
+        case. It's required (instead of the email) to compute SECRET_HASH for
+        the REFRESH_TOKEN_AUTH flow; Cognito accepts the email alias for the
+        initial SRP login but rejects it here. Persist alongside the refresh
+        token so future renewals don't need the password.
+        """
+        return self._cognito_username
+
     def authenticate(self) -> None:
         """Sign in to the Cognito User Pool. Raises ZephyrAuthError.
 
@@ -142,13 +173,13 @@ class ZephyrCloud:
         only falls back to a full SRP password login when that's unavailable
         or has expired.
         """
-        if self._refresh_token:
+        if self._refresh_token and self._cognito_username:
             cog = Cognito(
                 COGNITO_USER_POOL_ID,
                 COGNITO_APP_CLIENT_ID,
                 client_secret=COGNITO_APP_CLIENT_SECRET,
                 user_pool_region=AWS_REGION,
-                username=self._email,
+                username=self._cognito_username,
                 refresh_token=self._refresh_token,
             )
             try:
@@ -161,7 +192,7 @@ class ZephyrCloud:
                     err,
                 )
             else:
-                self._cognito = cog
+                self._finish_auth(cog)
                 return
 
         if not self._password:
@@ -178,7 +209,13 @@ class ZephyrCloud:
             cog.authenticate(password=self._password)
         except Exception as err:  # pycognito raises various boto exceptions
             raise ZephyrAuthError(str(err)) from err
+        self._finish_auth(cog)
+
+    def _finish_auth(self, cog: Cognito) -> None:
         self._cognito = cog
+        username = _jwt_claim(cog.id_token, "cognito:username")
+        if username:
+            self._cognito_username = username
 
     def _ensure_token(self) -> None:
         with self._lock:

@@ -7,6 +7,9 @@ MANUFACTURER = "Zephyr"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_REFRESH_TOKEN = "refresh_token"
+# Cognito's internal username (UUID-style `cognito:username` claim, distinct
+# from the email alias) — required to renew the refresh token. See api.py.
+CONF_COGNITO_USERNAME = "cognito_username"
 
 # --- Zephyr Connect cloud (AWS Amplify backend) ---------------------------------
 # These identifiers are *baked into the public Zephyr Connect Android app*

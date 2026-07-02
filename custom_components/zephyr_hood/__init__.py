@@ -10,7 +10,14 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import ZephyrApiError, ZephyrAuthError, ZephyrCloud
-from .const import CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_TOKEN, DOMAIN, PLATFORMS
+from .const import (
+    CONF_COGNITO_USERNAME,
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_REFRESH_TOKEN,
+    DOMAIN,
+    PLATFORMS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +47,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data[CONF_EMAIL],
         password=entry.data.get(CONF_PASSWORD),
         refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+        cognito_username=entry.data.get(CONF_COGNITO_USERNAME),
     )
 
     try:
@@ -53,10 +61,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # plaintext password (migrates existing entries that predate this).
     if cloud.refresh_token and (
         entry.data.get(CONF_REFRESH_TOKEN) != cloud.refresh_token
+        or entry.data.get(CONF_COGNITO_USERNAME) != cloud.cognito_username
         or CONF_PASSWORD in entry.data
     ):
         new_data = {k: v for k, v in entry.data.items() if k != CONF_PASSWORD}
         new_data[CONF_REFRESH_TOKEN] = cloud.refresh_token
+        if cloud.cognito_username:
+            new_data[CONF_COGNITO_USERNAME] = cloud.cognito_username
         hass.config_entries.async_update_entry(entry, data=new_data)
 
     try:

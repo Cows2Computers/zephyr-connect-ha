@@ -15,7 +15,14 @@ from homeassistant.helpers.selector import (
 )
 
 from .api import ZephyrApiError, ZephyrAuthError, ZephyrCloud
-from .const import CONF_EMAIL, CONF_PASSWORD, CONF_REFRESH_TOKEN, DOMAIN, MANUFACTURER
+from .const import (
+    CONF_COGNITO_USERNAME,
+    CONF_EMAIL,
+    CONF_PASSWORD,
+    CONF_REFRESH_TOKEN,
+    DOMAIN,
+    MANUFACTURER,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -84,6 +91,7 @@ class ZephyrHoodConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         data={
                             CONF_EMAIL: user_input[CONF_EMAIL],
                             CONF_REFRESH_TOKEN: cloud.refresh_token,
+                            CONF_COGNITO_USERNAME: cloud.cognito_username,
                         },
                     )
 
@@ -127,6 +135,7 @@ class ZephyrHoodConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     k: v for k, v in self._reauth_entry.data.items() if k != CONF_PASSWORD
                 }
                 new_data[CONF_REFRESH_TOKEN] = cloud.refresh_token
+                new_data[CONF_COGNITO_USERNAME] = cloud.cognito_username
                 return self.async_update_reload_and_abort(
                     self._reauth_entry, data=new_data
                 )
