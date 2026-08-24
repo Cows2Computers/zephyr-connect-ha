@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components import persistent_notification
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -25,9 +26,13 @@ _LOGGER = logging.getLogger(__name__)
 class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Push coordinator: shadow state arrives via MQTT, not polling."""
 
-    def __init__(self, hass: HomeAssistant, cloud: ZephyrCloud, devices: list[dict]) -> None:
+    def __init__(
+        self, hass: HomeAssistant, cloud: ZephyrCloud, devices: list[dict], entry: ConfigEntry
+    ) -> None:
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=None)
         self.cloud = cloud
+        self.entry = entry
+        self._reauth_started = False
         self.devices = {d["thingName"]: d for d in devices if d.get("thingName")}
         self.data = {thing: {} for thing in self.devices}
 
@@ -39,6 +44,48 @@ class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     def on_shadow(self, thing: str, reported: dict[str, Any]) -> None:
         """MQTT callback (paho thread) -> marshal onto the event loop."""
         self.hass.loop.call_soon_threadsafe(self._apply, thing, reported)
+
+    def on_connection_health(self, connected: bool) -> None:
+        """MQTT callback (paho thread) -> marshal onto the event loop."""
+        self.hass.loop.call_soon_threadsafe(self._set_connected, connected)
+
+    @callback
+    def _set_connected(self, connected: bool) -> None:
+        if self.last_update_success == connected:
+            return
+        self.last_update_success = connected
+        self.async_update_listeners()
+
+    def on_auth_failed(self) -> None:
+        """MQTT/background-thread callback -> marshal onto the event loop."""
+        self.hass.loop.call_soon_threadsafe(self._start_reauth)
+
+    @callback
+    def _start_reauth(self) -> None:
+        if self._reauth_started:
+            return
+        self._reauth_started = True
+        self.hass.async_create_task(
+            self.hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": SOURCE_REAUTH, "entry_id": self.entry.entry_id},
+                data=self.entry.data,
+            )
+        )
+
+    def on_command_failed(self, thing: str, field: str, value: Any, reason: str) -> None:
+        """MQTT/background-thread callback -> marshal onto the event loop."""
+        self.hass.loop.call_soon_threadsafe(self._notify_command_failed, thing, field, value, reason)
+
+    @callback
+    def _notify_command_failed(self, thing: str, field: str, value: Any, reason: str) -> None:
+        name = self.devices.get(thing, {}).get("modelName") or thing
+        persistent_notification.async_create(
+            self.hass,
+            f"Setting **{field}** to `{value}` on **{name}** failed: {reason}",
+            title="Zephyr Hood command failed",
+            notification_id=f"zephyr_hood_cmd_{thing}_{field}",
+        )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -93,10 +140,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if details.get(key) is not None:
                 device[key] = details[key]
 
-    coordinator = ZephyrCoordinator(hass, cloud, devices)
+    coordinator = ZephyrCoordinator(hass, cloud, devices, entry)
 
     try:
-        await hass.async_add_executor_job(cloud.connect, coordinator.on_shadow)
+        await hass.async_add_executor_job(
+            cloud.connect,
+            coordinator.on_shadow,
+            coordinator.on_connection_health,
+            coordinator.on_auth_failed,
+            coordinator.on_command_failed,
+        )
     except ZephyrApiError as err:
         raise ConfigEntryNotReady(f"MQTT connect failed: {err}") from err
     for thing in coordinator.devices:

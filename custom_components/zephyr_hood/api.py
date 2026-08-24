@@ -48,6 +48,14 @@ logging.getLogger("paho").setLevel(logging.WARNING)
 _RECONNECT_MIN_DELAY = 1
 _RECONNECT_MAX_DELAY = 60
 
+# Refresh AWS creds this long before they expire, so a presigned URL never
+# goes stale while the socket is still open.
+_CRED_REFRESH_BUFFER = 300
+
+# How long to wait for a shadow update/accepted|rejected echo (matched by
+# clientToken) before treating an in-flight command as failed.
+_COMMAND_TIMEOUT = 20
+
 
 class ZephyrAuthError(Exception):
     """Raised on Cognito authentication failure (bad credentials)."""
@@ -129,6 +137,12 @@ class ZephyrCloud:
         self._ssl_gemtek: ssl.SSLContext | None = None
         self._reconnect_delay = _RECONNECT_MIN_DELAY
         self._closing = False
+        self._connected = False
+        self._on_connection_health: Callable[[bool], None] | None = None
+        self._on_auth_failed: Callable[[], None] | None = None
+        self._on_command_failed: Callable[[str, str, Any, str], None] | None = None
+        self._cred_timer: threading.Timer | None = None
+        self._pending: dict[str, tuple[str, str, Any, threading.Timer]] = {}
 
     def _ctx_aws(self) -> ssl.SSLContext:
         """Lazily build the AWS SSL context. Only called from executor threads
@@ -325,6 +339,7 @@ class ZephyrCloud:
     # ------------------------------------------- SigV4 presigned WS path ------
     def _signed_ws_path(self) -> str:
         creds = self._aws_credentials()
+        self._schedule_cred_refresh(creds.get("Expiration"))
         ak, sk, token = creds["AccessKeyId"], creds["SecretKey"], creds["SessionToken"]
         service = "iotdevicegateway"
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -363,10 +378,38 @@ class ZephyrCloud:
             f"&X-Amz-Security-Token={urllib.parse.quote(token, safe='')}"
         )
 
+    def _schedule_cred_refresh(self, expiration: float | None) -> None:
+        """Proactively refresh + reconnect shortly before creds expire."""
+        if self._cred_timer is not None:
+            self._cred_timer.cancel()
+            self._cred_timer = None
+        if expiration is None or self._closing:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        delay = max(expiration - now - _CRED_REFRESH_BUFFER, 1)
+        self._cred_timer = threading.Timer(delay, self._proactive_refresh)
+        self._cred_timer.daemon = True
+        self._cred_timer.start()
+
+    def _proactive_refresh(self) -> None:
+        if self._closing or not self._client:
+            return
+        _LOGGER.debug("Zephyr AWS credentials nearing expiry; refreshing proactively")
+        self._reconnect(self._client)
+
     # --------------------------------------------------------------- MQTT ------
-    def connect(self, on_state: Callable[[str, dict[str, Any]], None]) -> None:
+    def connect(
+        self,
+        on_state: Callable[[str, dict[str, Any]], None],
+        on_connection_health: Callable[[bool], None] | None = None,
+        on_auth_failed: Callable[[], None] | None = None,
+        on_command_failed: Callable[[str, str, Any, str], None] | None = None,
+    ) -> None:
         """Open the persistent MQTT connection. Blocking — call in executor."""
         self._on_state = on_state
+        self._on_connection_health = on_connection_health
+        self._on_auth_failed = on_auth_failed
+        self._on_command_failed = on_command_failed
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="ha-zephyr-" + uuid.uuid4().hex[:10],
@@ -389,7 +432,7 @@ class ZephyrCloud:
     def _subscribe(self, thing_name: str) -> None:
         if not self._client:
             return
-        for suffix in ("get/accepted", "update/accepted", "update/documents"):
+        for suffix in ("get/accepted", "update/accepted", "update/rejected", "update/documents"):
             self._client.subscribe(f"$aws/things/{thing_name}/shadow/{suffix}", qos=1)
         self.request_state(thing_name)
 
@@ -398,14 +441,34 @@ class ZephyrCloud:
             self._client.publish(f"$aws/things/{thing_name}/shadow/get", "", qos=1)
 
     def set_value(self, thing_name: str, field: str, value: Any) -> None:
-        """Send a control command by writing the shadow `reported` block."""
-        if not self._client:
+        """Send a control command by writing the shadow `reported` block.
+
+        Tracks the shadow response (matched via `clientToken`) so a rejected
+        or unconfirmed command surfaces via `_on_command_failed` instead of
+        failing silently.
+        """
+        if not self._client or not self._connected:
+            if self._on_command_failed:
+                self._on_command_failed(thing_name, field, value, "not connected to Zephyr cloud")
             raise ZephyrApiError("MQTT not connected")
-        payload = json.dumps({"state": {"reported": {field: value}}})
+        token = uuid.uuid4().hex
+        payload = json.dumps({"state": {"reported": {field: value}}, "clientToken": token})
+        timer = threading.Timer(_COMMAND_TIMEOUT, self._command_timeout, args=(token,))
+        timer.daemon = True
+        with self._lock:
+            self._pending[token] = (thing_name, field, value, timer)
+        timer.start()
         self._client.publish(f"$aws/things/{thing_name}/shadow/update", payload, qos=1)
 
     def disconnect(self) -> None:
         self._closing = True
+        if self._cred_timer is not None:
+            self._cred_timer.cancel()
+            self._cred_timer = None
+        with self._lock:
+            pending, self._pending = list(self._pending.values()), {}
+        for *_rest, timer in pending:
+            timer.cancel()
         if self._client:
             self._client.loop_stop()
             self._client.disconnect()
@@ -414,7 +477,10 @@ class ZephyrCloud:
     # ------------------------------------------------------ MQTT callbacks ----
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         _LOGGER.debug("Zephyr MQTT connected (%s)", reason_code)
+        self._connected = True
         self._reconnect_delay = _RECONNECT_MIN_DELAY
+        if self._on_connection_health:
+            self._on_connection_health(True)
         for thing in list(self._things):
             self._subscribe(thing)
 
@@ -423,6 +489,12 @@ class ZephyrCloud:
             doc = json.loads(msg.payload)
         except (ValueError, TypeError):
             return
+        token = doc.get("clientToken")
+        rejected = msg.topic.endswith("/update/rejected")
+        if token:
+            self._resolve_command(token, rejected, doc)
+        if rejected:
+            return  # rejected docs carry an error, not shadow state
         parts = msg.topic.split("/")
         thing = parts[2] if len(parts) > 2 and parts[0] == "$aws" else None
         state = doc.get("state", {})
@@ -432,9 +504,36 @@ class ZephyrCloud:
         if thing and reported and self._on_state:
             self._on_state(thing, reported)
 
+    def _resolve_command(self, token: str, rejected: bool, doc: dict[str, Any]) -> None:
+        with self._lock:
+            pending = self._pending.pop(token, None)
+        if pending is None:
+            return
+        thing, field, value, timer = pending
+        timer.cancel()
+        if rejected and self._on_command_failed:
+            reason = doc.get("message") or f"rejected (code {doc.get('code')})"
+            self._on_command_failed(thing, field, value, reason)
+
+    def _command_timeout(self, token: str) -> None:
+        with self._lock:
+            pending = self._pending.pop(token, None)
+        if pending is None:
+            return
+        thing, field, value, _timer = pending
+        _LOGGER.warning(
+            "Zephyr command timed out waiting for confirmation: %s.%s=%s", thing, field, value
+        )
+        if self._on_command_failed:
+            self._on_command_failed(thing, field, value, "no confirmation from device (timed out)")
+
     def _on_disconnect(self, client, userdata, *args) -> None:
         if self._closing:
             return
+        self._connected = False
+        if self._on_connection_health:
+            self._on_connection_health(False)
+        self._fail_all_pending("connection lost")
         # Credentials in the presigned URL expire; re-sign and reconnect, backing
         # off exponentially so a persistently unreachable broker doesn't spin.
         delay = self._reconnect_delay
@@ -442,11 +541,25 @@ class ZephyrCloud:
         _LOGGER.debug("Zephyr MQTT disconnected; reconnecting in %ss", delay)
         threading.Timer(delay, self._reconnect, args=(client,)).start()
 
+    def _fail_all_pending(self, reason: str) -> None:
+        with self._lock:
+            pending, self._pending = list(self._pending.items()), {}
+        for _token, (thing, field, value, timer) in pending:
+            timer.cancel()
+            if self._on_command_failed:
+                self._on_command_failed(thing, field, value, reason)
+
     def _reconnect(self, client: mqtt.Client) -> None:
         if self._closing:
             return
         try:
             client.ws_set_options(path=self._signed_ws_path())
             client.reconnect()
+        except ZephyrAuthError as err:
+            # Refresh token is dead and we have no password to fall back on —
+            # retrying won't help, surface it so the user can reauth via the UI.
+            _LOGGER.warning("Zephyr credentials need renewal: %s", err)
+            if self._on_auth_failed:
+                self._on_auth_failed()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Zephyr MQTT reconnect failed: %s", err)
