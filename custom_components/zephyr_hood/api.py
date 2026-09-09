@@ -114,6 +114,29 @@ def _jwt_claim(token: str, claim: str) -> str | None:
         return None
 
 
+# Cognito error codes that mean the refresh token/credentials are actually
+# invalid, as opposed to a transient network/service hiccup worth retrying.
+_AUTH_ERROR_CODES = {
+    "NotAuthorizedException",
+    "UserNotFoundException",
+    "PasswordResetRequiredException",
+    "UserNotConfirmedException",
+}
+
+
+def _is_cognito_auth_error(err: Exception) -> bool:
+    """True if `err` is a genuine Cognito auth rejection, not a transient one.
+
+    boto3/botocore's ClientError carries a `.response` dict with the service
+    error code; anything else raised by pycognito/boto during the HTTP call
+    (timeouts, connection errors, 5xx) doesn't, so it's treated as transient.
+    """
+    response = getattr(err, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return response.get("Error", {}).get("Code") in _AUTH_ERROR_CODES
+
+
 class ZephyrCloud:
     """Synchronous Zephyr cloud client. Blocking calls run in HA's executor."""
 
@@ -143,6 +166,7 @@ class ZephyrCloud:
         self._on_command_failed: Callable[[str, str, Any, str], None] | None = None
         self._cred_timer: threading.Timer | None = None
         self._pending: dict[str, tuple[str, str, Any, threading.Timer]] = {}
+        self._reconnect_lock = threading.Lock()
 
     def _ctx_aws(self) -> ssl.SSLContext:
         """Lazily build the AWS SSL context. Only called from executor threads
@@ -199,12 +223,20 @@ class ZephyrCloud:
             try:
                 cog.renew_access_token()
             except Exception as err:  # noqa: BLE001 - refresh token expired/invalid
-                if not self._password:
+                if self._password:
+                    _LOGGER.debug(
+                        "Zephyr refresh token renewal failed, falling back to password: %s",
+                        err,
+                    )
+                elif _is_cognito_auth_error(err):
                     raise ZephyrAuthError(f"refresh token invalid: {err}") from err
-                _LOGGER.debug(
-                    "Zephyr refresh token renewal failed, falling back to password: %s",
-                    err,
-                )
+                else:
+                    # Transient network/service failure with no password to fall
+                    # back on - surface as a retryable API error, not an auth
+                    # failure, so HA doesn't pop a needless reauth prompt.
+                    raise ZephyrApiError(
+                        f"refresh token renewal failed: {type(err).__name__}: {err}"
+                    ) from err
             else:
                 self._finish_auth(cog)
                 return
@@ -238,8 +270,16 @@ class ZephyrCloud:
                 return
             try:
                 self._cognito.check_token(renew=True)
-            except Exception:  # refresh token expired -> full re-auth
-                self.authenticate()
+            except Exception as err:  # noqa: BLE001
+                if self._password or _is_cognito_auth_error(err):
+                    self.authenticate()
+                else:
+                    # No password to fall back on and this doesn't look like a
+                    # real auth rejection - don't escalate a transient network
+                    # blip into a full re-auth attempt.
+                    raise ZephyrApiError(
+                        f"token refresh failed: {type(err).__name__}: {err}"
+                    ) from err
 
     # ------------------------------------------------- low-level AWS JSON ------
     def _aws_json(self, host: str, target: str, body: dict) -> dict:
@@ -552,6 +592,12 @@ class ZephyrCloud:
     def _reconnect(self, client: mqtt.Client) -> None:
         if self._closing:
             return
+        # The disconnect-triggered retry and the proactive cred-refresh timer
+        # can both land here at once; only one reconnect should run at a time,
+        # so a redundant caller skips rather than double-reconnecting.
+        if not self._reconnect_lock.acquire(blocking=False):
+            _LOGGER.debug("Zephyr reconnect already in progress; skipping")
+            return
         try:
             client.ws_set_options(path=self._signed_ws_path())
             client.reconnect()
@@ -563,3 +609,5 @@ class ZephyrCloud:
                 self._on_auth_failed()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Zephyr MQTT reconnect failed: %s", err)
+        finally:
+            self._reconnect_lock.release()
