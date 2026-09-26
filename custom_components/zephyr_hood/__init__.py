@@ -6,8 +6,9 @@ from typing import Any
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import ZephyrApiError, ZephyrAuthError, ZephyrCloud
@@ -22,6 +23,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long the MQTT link may be down before entities go unavailable, so a
+# routine ~1s reconnect doesn't flap every entity.
+_UNAVAILABLE_GRACE = 5
+
 
 class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Push coordinator: shadow state arrives via MQTT, not polling."""
@@ -33,6 +38,7 @@ class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self.cloud = cloud
         self.entry = entry
         self._reauth_started = False
+        self._unavailable_timer: CALLBACK_TYPE | None = None
         self.devices = {d["thingName"]: d for d in devices if d.get("thingName")}
         self.data = {thing: {} for thing in self.devices}
 
@@ -51,10 +57,29 @@ class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     @callback
     def _set_connected(self, connected: bool) -> None:
-        if self.last_update_success == connected:
+        if connected:
+            self.cancel_unavailable_timer()
+            if not self.last_update_success:
+                self.last_update_success = True
+                self.async_update_listeners()
             return
-        self.last_update_success = connected
+        # Only surface the outage if it outlasts the grace window.
+        if self.last_update_success and self._unavailable_timer is None:
+            self._unavailable_timer = async_call_later(
+                self.hass, _UNAVAILABLE_GRACE, self._mark_unavailable
+            )
+
+    @callback
+    def _mark_unavailable(self, _now) -> None:
+        self._unavailable_timer = None
+        self.last_update_success = False
         self.async_update_listeners()
+
+    @callback
+    def cancel_unavailable_timer(self) -> None:
+        if self._unavailable_timer is not None:
+            self._unavailable_timer()
+            self._unavailable_timer = None
 
     def on_auth_failed(self) -> None:
         """MQTT/background-thread callback -> marshal onto the event loop."""
@@ -165,5 +190,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         coordinator: ZephyrCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator.cancel_unavailable_timer()
         await hass.async_add_executor_job(coordinator.cloud.disconnect)
     return unload_ok

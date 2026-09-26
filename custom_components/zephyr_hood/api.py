@@ -48,10 +48,6 @@ logging.getLogger("paho").setLevel(logging.WARNING)
 _RECONNECT_MIN_DELAY = 1
 _RECONNECT_MAX_DELAY = 60
 
-# Refresh AWS creds this long before they expire, so a presigned URL never
-# goes stale while the socket is still open.
-_CRED_REFRESH_BUFFER = 300
-
 # How long to wait for a shadow update/accepted|rejected echo (matched by
 # clientToken) before treating an in-flight command as failed.
 _COMMAND_TIMEOUT = 20
@@ -158,15 +154,12 @@ class ZephyrCloud:
         self._things: set[str] = set()
         self._ssl_aws: ssl.SSLContext | None = None
         self._ssl_gemtek: ssl.SSLContext | None = None
-        self._reconnect_delay = _RECONNECT_MIN_DELAY
         self._closing = False
         self._connected = False
         self._on_connection_health: Callable[[bool], None] | None = None
         self._on_auth_failed: Callable[[], None] | None = None
         self._on_command_failed: Callable[[str, str, Any, str], None] | None = None
-        self._cred_timer: threading.Timer | None = None
         self._pending: dict[str, tuple[str, str, Any, threading.Timer]] = {}
-        self._reconnect_lock = threading.Lock()
 
     def _ctx_aws(self) -> ssl.SSLContext:
         """Lazily build the AWS SSL context. Only called from executor threads
@@ -379,7 +372,6 @@ class ZephyrCloud:
     # ------------------------------------------- SigV4 presigned WS path ------
     def _signed_ws_path(self) -> str:
         creds = self._aws_credentials()
-        self._schedule_cred_refresh(creds.get("Expiration"))
         ak, sk, token = creds["AccessKeyId"], creds["SecretKey"], creds["SessionToken"]
         service = "iotdevicegateway"
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -418,25 +410,6 @@ class ZephyrCloud:
             f"&X-Amz-Security-Token={urllib.parse.quote(token, safe='')}"
         )
 
-    def _schedule_cred_refresh(self, expiration: float | None) -> None:
-        """Proactively refresh + reconnect shortly before creds expire."""
-        if self._cred_timer is not None:
-            self._cred_timer.cancel()
-            self._cred_timer = None
-        if expiration is None or self._closing:
-            return
-        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        delay = max(expiration - now - _CRED_REFRESH_BUFFER, 1)
-        self._cred_timer = threading.Timer(delay, self._proactive_refresh)
-        self._cred_timer.daemon = True
-        self._cred_timer.start()
-
-    def _proactive_refresh(self) -> None:
-        if self._closing or not self._client:
-            return
-        _LOGGER.debug("Zephyr AWS credentials nearing expiry; refreshing proactively")
-        self._reconnect(self._client)
-
     # --------------------------------------------------------------- MQTT ------
     def connect(
         self,
@@ -457,10 +430,15 @@ class ZephyrCloud:
         )
         client.tls_set_context(self._ctx_aws())
         client.ws_set_options(path=self._signed_ws_path())
+        # paho's loop thread owns reconnection; this is its backoff.
+        client.reconnect_delay_set(_RECONNECT_MIN_DELAY, _RECONNECT_MAX_DELAY)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
         client.connect(IOT_ENDPOINT, 443, keepalive=30)
+        # Registered after the initial connect (signed above, with errors
+        # surfaced to the caller) so it only runs for paho's auto-reconnects.
+        client.on_pre_connect = self._on_pre_connect
         client.loop_start()
         self._client = client
 
@@ -502,9 +480,6 @@ class ZephyrCloud:
 
     def disconnect(self) -> None:
         self._closing = True
-        if self._cred_timer is not None:
-            self._cred_timer.cancel()
-            self._cred_timer = None
         with self._lock:
             pending, self._pending = list(self._pending.values()), {}
         for *_rest, timer in pending:
@@ -518,7 +493,6 @@ class ZephyrCloud:
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         _LOGGER.debug("Zephyr MQTT connected (%s)", reason_code)
         self._connected = True
-        self._reconnect_delay = _RECONNECT_MIN_DELAY
         if self._on_connection_health:
             self._on_connection_health(True)
         for thing in list(self._things):
@@ -574,12 +548,9 @@ class ZephyrCloud:
         if self._on_connection_health:
             self._on_connection_health(False)
         self._fail_all_pending("connection lost")
-        # Credentials in the presigned URL expire; re-sign and reconnect, backing
-        # off exponentially so a persistently unreachable broker doesn't spin.
-        delay = self._reconnect_delay
-        self._reconnect_delay = min(self._reconnect_delay * 2, _RECONNECT_MAX_DELAY)
-        _LOGGER.debug("Zephyr MQTT disconnected; reconnecting in %ss", delay)
-        threading.Timer(delay, self._reconnect, args=(client,)).start()
+        # paho's loop thread reconnects on its own (backoff via
+        # reconnect_delay_set), re-signing the URL in _on_pre_connect.
+        _LOGGER.debug("Zephyr MQTT disconnected; paho will reconnect")
 
     def _fail_all_pending(self, reason: str) -> None:
         with self._lock:
@@ -589,25 +560,23 @@ class ZephyrCloud:
             if self._on_command_failed:
                 self._on_command_failed(thing, field, value, reason)
 
-    def _reconnect(self, client: mqtt.Client) -> None:
+    def _on_pre_connect(self, client, userdata) -> None:
+        """Re-sign the WebSocket URL before each of paho's automatic reconnects.
+
+        Runs on paho's loop thread, so reconnection never races the socket from
+        another thread. The presigned URL embeds short-lived AWS creds, so every
+        attempt needs a fresh one. Must not raise: paho re-raises callback
+        exceptions, which would kill its loop thread.
+        """
         if self._closing:
-            return
-        # The disconnect-triggered retry and the proactive cred-refresh timer
-        # can both land here at once; only one reconnect should run at a time,
-        # so a redundant caller skips rather than double-reconnecting.
-        if not self._reconnect_lock.acquire(blocking=False):
-            _LOGGER.debug("Zephyr reconnect already in progress; skipping")
             return
         try:
             client.ws_set_options(path=self._signed_ws_path())
-            client.reconnect()
         except ZephyrAuthError as err:
             # Refresh token is dead and we have no password to fall back on —
-            # retrying won't help, surface it so the user can reauth via the UI.
+            # surface it so the user can reauth via the UI.
             _LOGGER.warning("Zephyr credentials need renewal: %s", err)
             if self._on_auth_failed:
                 self._on_auth_failed()
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Zephyr MQTT reconnect failed: %s", err)
-        finally:
-            self._reconnect_lock.release()
+        except Exception as err:  # noqa: BLE001 - paho retries with backoff
+            _LOGGER.warning("Zephyr could not re-sign MQTT URL, will retry: %s", err)
