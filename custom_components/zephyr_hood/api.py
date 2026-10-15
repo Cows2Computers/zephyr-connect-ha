@@ -464,6 +464,14 @@ class ZephyrCloud:
         Tracks the shadow response (matched via `clientToken`) so a rejected
         or unconfirmed command surfaces via `_on_command_failed` instead of
         failing silently.
+
+        NOTE: standard AWS IoT semantics put controller intent in `desired` (the
+        device receives a delta and acts); `reported` is the device stating what
+        it already is. Zephyr's own hoods appear to act on `reported`, which is
+        why this is written the way it is — but it means a command the hood
+        ignores still lands in the shadow and looks accepted (the shadow
+        service, not the hood, sends update/accepted). If a control ever proves
+        not to reach the hood, `desired` is the first thing to try.
         """
         if not self._client or not self._connected:
             if self._on_command_failed:
