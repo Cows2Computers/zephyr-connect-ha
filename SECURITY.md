@@ -12,16 +12,18 @@ Do **not** include your Zephyr credentials, Cognito/ID tokens, device
 
 ## What this integration handles
 
-- **Your Zephyr password is never persisted.** It's used once, in memory, to sign
-  in to Zephyr's own Cognito pool, then discarded. What's stored in your Home
-  Assistant config entry (HA's encrypted `.storage`) is your email and the
-  Cognito **refresh token** issued at sign-in, which is scoped to that pool and
-  can't be used to derive your password. If the refresh token expires, HA's
-  reauth flow will ask you to enter your password again (again used once, not
-  stored). Existing config entries created before this change had the password
-  stored; they are automatically migrated to a refresh token the next time the
-  integration starts. If you ever shared your password (e.g. while debugging),
-  rotate it.
+- **Your Zephyr password is stored in your Home Assistant config entry**,
+  alongside your email and the Cognito **refresh token** issued at sign-in.
+  HA's `.storage` is plain JSON on disk, not encrypted, so anyone who can read
+  your HA config directory or an unencrypted backup can read it. It's stored
+  because Cognito refresh tokens have a hard ~30-day lifetime: without the
+  password, the integration would stop working every month until you
+  re-entered it. Day to day, sign-in uses the refresh token; the password is
+  sent (only to Zephyr's own Cognito pool) when that token expires. Versions
+  0.4.x did not store the password; entries created by them will prompt for
+  reauth once when their token expires, and keep the password from then on.
+  Use a unique password for your Zephyr account, and if you ever shared it
+  (e.g. while debugging), rotate it.
 - **The AWS Cognito pool/client IDs and client secret in `const.py` are not your
   secrets.** They are the public Zephyr Connect app's own configuration —
   identical in every copy of the app — and are required for Cognito's

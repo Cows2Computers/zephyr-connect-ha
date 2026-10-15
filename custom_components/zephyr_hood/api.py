@@ -28,6 +28,7 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 from pycognito import Cognito
+from pycognito.exceptions import ForceChangePasswordException, MFAChallengeException
 
 from .const import (
     APP_API_BASE_URL,
@@ -54,7 +55,7 @@ _COMMAND_TIMEOUT = 20
 
 
 class ZephyrAuthError(Exception):
-    """Raised on Cognito authentication failure (bad credentials)."""
+    """Raised when Cognito rejects the credentials and the user must reauth."""
 
 
 class ZephyrApiError(Exception):
@@ -126,7 +127,11 @@ def _is_cognito_auth_error(err: Exception) -> bool:
     boto3/botocore's ClientError carries a `.response` dict with the service
     error code; anything else raised by pycognito/boto during the HTTP call
     (timeouts, connection errors, 5xx) doesn't, so it's treated as transient.
+    pycognito's own challenge exceptions (forced password change, MFA) also
+    need the user, so they count as rejections too.
     """
+    if isinstance(err, (ForceChangePasswordException, MFAChallengeException)):
+        return True
     response = getattr(err, "response", None)
     if not isinstance(response, dict):
         return False
@@ -159,6 +164,7 @@ class ZephyrCloud:
         self._on_connection_health: Callable[[bool], None] | None = None
         self._on_auth_failed: Callable[[], None] | None = None
         self._on_command_failed: Callable[[str, str, Any, str], None] | None = None
+        self._on_tokens_changed: Callable[[], None] | None = None
         self._pending: dict[str, tuple[str, str, Any, threading.Timer]] = {}
 
     def _ctx_aws(self) -> ssl.SSLContext:
@@ -178,8 +184,8 @@ class ZephyrCloud:
     # ----------------------------------------------------------------- auth ----
     @property
     def refresh_token(self) -> str | None:
-        """Current Cognito refresh token. Callers should persist this instead
-        of the account password once available."""
+        """Current Cognito refresh token. Callers should persist this alongside
+        the password, since a password fallback mints a new one."""
         if self._cognito is not None:
             return self._cognito.refresh_token
         return self._refresh_token
@@ -198,11 +204,19 @@ class ZephyrCloud:
         return self._cognito_username
 
     def authenticate(self) -> None:
-        """Sign in to the Cognito User Pool. Raises ZephyrAuthError.
+        """Sign in to the Cognito User Pool.
 
-        Prefers renewing from a stored refresh token (no password needed) and
-        only falls back to a full SRP password login when that's unavailable
-        or has expired.
+        Precedence:
+          1. Renew from the stored refresh token (REFRESH_TOKEN_AUTH).
+          2. If Cognito rejects that token (refresh tokens have a hard ~30 day
+             lifetime) and a password is stored, fall back to a full SRP login.
+             Routine, roughly monthly.
+          3. Raise ZephyrAuthError only on a genuine rejection with nothing left
+             to fall back on: SRP itself rejected, or a dead refresh token and
+             no stored password (entries created by 0.4.x).
+
+        A transient failure (network, throttling, 5xx) on either path raises
+        ZephyrApiError so callers retry instead of prompting for reauth.
         """
         if self._refresh_token and self._cognito_username:
             cog = Cognito(
@@ -215,21 +229,19 @@ class ZephyrCloud:
             )
             try:
                 cog.renew_access_token()
-            except Exception as err:  # noqa: BLE001 - refresh token expired/invalid
-                if self._password:
-                    _LOGGER.debug(
-                        "Zephyr refresh token renewal failed, falling back to password: %s",
-                        err,
-                    )
-                elif _is_cognito_auth_error(err):
-                    raise ZephyrAuthError(f"refresh token invalid: {err}") from err
-                else:
-                    # Transient network/service failure with no password to fall
-                    # back on - surface as a retryable API error, not an auth
-                    # failure, so HA doesn't pop a needless reauth prompt.
+            except Exception as err:  # noqa: BLE001 - classified below
+                if not _is_cognito_auth_error(err):
+                    # Transient network/service failure - retry later rather
+                    # than burning a password login or prompting for reauth.
                     raise ZephyrApiError(
                         f"refresh token renewal failed: {type(err).__name__}: {err}"
                     ) from err
+                if not self._password:
+                    raise ZephyrAuthError(f"refresh token invalid: {err}") from err
+                _LOGGER.info(
+                    "Zephyr refresh token rejected (%s); signing in with stored password",
+                    err,
+                )
             else:
                 self._finish_auth(cog)
                 return
@@ -246,12 +258,21 @@ class ZephyrCloud:
         )
         try:
             cog.authenticate(password=self._password)
-        except Exception as err:  # pycognito raises various boto exceptions
-            raise ZephyrAuthError(str(err)) from err
+        except Exception as err:  # noqa: BLE001 - pycognito raises various boto exceptions
+            if _is_cognito_auth_error(err):
+                raise ZephyrAuthError(str(err)) from err
+            raise ZephyrApiError(
+                f"password sign-in failed: {type(err).__name__}: {err}"
+            ) from err
         self._finish_auth(cog)
+        # SRP mints a new refresh token; let the owner persist it so we don't
+        # repeat this on every restart.
+        if self._on_tokens_changed:
+            self._on_tokens_changed()
 
     def _finish_auth(self, cog: Cognito) -> None:
         self._cognito = cog
+        self._refresh_token = cog.refresh_token
         username = _jwt_claim(cog.id_token, "cognito:username")
         if username:
             self._cognito_username = username
@@ -264,15 +285,14 @@ class ZephyrCloud:
             try:
                 self._cognito.check_token(renew=True)
             except Exception as err:  # noqa: BLE001
-                if self._password or _is_cognito_auth_error(err):
-                    self.authenticate()
-                else:
-                    # No password to fall back on and this doesn't look like a
-                    # real auth rejection - don't escalate a transient network
-                    # blip into a full re-auth attempt.
+                if not _is_cognito_auth_error(err):
+                    # Don't escalate a transient network blip into a re-auth.
                     raise ZephyrApiError(
                         f"token refresh failed: {type(err).__name__}: {err}"
                     ) from err
+                # Refresh token rejected - authenticate() falls back to the
+                # stored password if there is one.
+                self.authenticate()
 
     # ------------------------------------------------- low-level AWS JSON ------
     def _aws_json(self, host: str, target: str, body: dict) -> dict:
@@ -417,12 +437,14 @@ class ZephyrCloud:
         on_connection_health: Callable[[bool], None] | None = None,
         on_auth_failed: Callable[[], None] | None = None,
         on_command_failed: Callable[[str, str, Any, str], None] | None = None,
+        on_tokens_changed: Callable[[], None] | None = None,
     ) -> None:
         """Open the persistent MQTT connection. Blocking — call in executor."""
         self._on_state = on_state
         self._on_connection_health = on_connection_health
         self._on_auth_failed = on_auth_failed
         self._on_command_failed = on_command_failed
+        self._on_tokens_changed = on_tokens_changed
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="ha-zephyr-" + uuid.uuid4().hex[:10],
@@ -581,9 +603,9 @@ class ZephyrCloud:
         try:
             client.ws_set_options(path=self._signed_ws_path())
         except ZephyrAuthError as err:
-            # Refresh token is dead and we have no password to fall back on —
-            # surface it so the user can reauth via the UI.
-            _LOGGER.warning("Zephyr credentials need renewal: %s", err)
+            # Cognito rejected the password (or the refresh token, with no
+            # password stored) — only the user can fix this.
+            _LOGGER.error("Zephyr sign-in rejected, reauthentication required: %s", err)
             if self._on_auth_failed:
                 self._on_auth_failed()
         except Exception as err:  # noqa: BLE001 - paho retries with backoff

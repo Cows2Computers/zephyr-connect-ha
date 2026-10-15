@@ -64,19 +64,21 @@ runs cleanly on Home Assistant OS):
 The AWS identifiers in `const.py` (Cognito pool/client IDs, IoT endpoint) are the
 app's own public configuration — they are embedded in every copy of the Zephyr
 Connect app and are required for sign-in to work. They are **not** account
-secrets; you still authenticate with your personal email and password. The
-password itself is only used once to sign in — what's actually stored in your
-Home Assistant config entry is your email and the Cognito refresh token issued
-at sign-in.
+secrets; you still authenticate with your personal email and password, which
+are stored in your Home Assistant config entry along with the Cognito refresh
+token issued at sign-in.
 
 ## Security & privacy
 
-- **Your credentials stay in your HA.** Your Zephyr password is never stored —
-  only used once at sign-in. The config entry (HA's encrypted `.storage`) holds
-  your email and a Cognito refresh token instead, sent only to Zephyr's own
-  Cognito sign-in — never to this project or any third party. If the refresh
-  token expires, HA's reauth flow will prompt for your password again. No
-  secrets (credentials, tokens, or the signed MQTT URL) are written to the log.
+- **Your credentials stay in your HA.** The config entry holds your email, your
+  Zephyr password, and a Cognito refresh token. It lives in HA's `.storage`
+  directory, which is plain JSON on disk — **not encrypted**. They're sent only
+  to Zephyr's own Cognito sign-in — never to this project or any third party.
+  Day-to-day sign-in uses the refresh token; Cognito caps its lifetime at ~30
+  days, and when it expires the stored password is used to get a new one
+  automatically. You're only asked to reauth if Zephyr rejects the password
+  itself (e.g. you changed it). No secrets (credentials, tokens, or the signed
+  MQTT URL) are written to the log.
 - **The `const.py` AWS IDs/secret are not yours.** They're the public app's own
   configuration, identical in every APK, required for Cognito `SECRET_HASH`
   sign-in. They identify the shared Zephyr backend, not an account.

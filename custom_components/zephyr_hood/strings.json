@@ -11,7 +11,7 @@
       },
       "reauth_confirm": {
         "title": "Reauthenticate Zephyr Hood",
-        "description": "Your Zephyr Connect session for {email} has expired. Enter your password to reconnect.",
+        "description": "Zephyr Connect rejected the saved sign-in for {email}. Enter your current password to reconnect.",
         "data": {
           "password": "Password"
         }

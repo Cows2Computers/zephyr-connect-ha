@@ -84,12 +84,14 @@ class ZephyrHoodConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     await self.async_set_unique_id(user_input[CONF_EMAIL].lower())
                     self._abort_if_unique_id_configured()
-                    # Store the refresh token, not the password: the password
-                    # is only ever used transiently to obtain the token.
+                    # Store the password alongside the refresh token: Cognito
+                    # refresh tokens expire after ~30 days regardless of use,
+                    # and the password lets us mint a new one unattended.
                     return self.async_create_entry(
                         title=f"{MANUFACTURER} Hood",
                         data={
                             CONF_EMAIL: user_input[CONF_EMAIL],
+                            CONF_PASSWORD: user_input[CONF_PASSWORD],
                             CONF_REFRESH_TOKEN: cloud.refresh_token,
                             CONF_COGNITO_USERNAME: cloud.cognito_username,
                         },
@@ -102,7 +104,7 @@ class ZephyrHoodConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
     ) -> FlowResult:
-        """Handle re-authentication when the stored refresh token has expired."""
+        """Handle re-authentication when Cognito rejects the stored credentials."""
         self._reauth_entry = self.hass.config_entries.async_get_entry(
             self.context["entry_id"]
         )
@@ -131,11 +133,13 @@ class ZephyrHoodConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error validating Zephyr credentials")
                 errors["base"] = "unknown"
             else:
+                # Also migrates 0.4.x entries, which had the password stripped.
                 new_data = {
-                    k: v for k, v in self._reauth_entry.data.items() if k != CONF_PASSWORD
+                    **self._reauth_entry.data,
+                    CONF_PASSWORD: user_input[CONF_PASSWORD],
+                    CONF_REFRESH_TOKEN: cloud.refresh_token,
+                    CONF_COGNITO_USERNAME: cloud.cognito_username,
                 }
-                new_data[CONF_REFRESH_TOKEN] = cloud.refresh_token
-                new_data[CONF_COGNITO_USERNAME] = cloud.cognito_username
                 return self.async_update_reload_and_abort(
                     self._reauth_entry, data=new_data
                 )

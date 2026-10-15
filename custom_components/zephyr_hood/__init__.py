@@ -112,6 +112,27 @@ class ZephyrCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             notification_id=f"zephyr_hood_cmd_{thing}_{field}",
         )
 
+    def on_tokens_changed(self) -> None:
+        """MQTT/background-thread callback -> marshal onto the event loop."""
+        self.hass.loop.call_soon_threadsafe(
+            _async_persist_tokens, self.hass, self.entry, self.cloud
+        )
+
+
+@callback
+def _async_persist_tokens(hass: HomeAssistant, entry: ConfigEntry, cloud: ZephyrCloud) -> None:
+    """Write the current refresh token back to the config entry.
+
+    Keeps the stored password: it's what recovers from the refresh token's
+    hard ~30 day expiry without user action.
+    """
+    if not cloud.refresh_token:
+        return
+    new_data = {**entry.data, CONF_REFRESH_TOKEN: cloud.refresh_token}
+    if cloud.cognito_username:
+        new_data[CONF_COGNITO_USERNAME] = cloud.cognito_username
+    hass.config_entries.async_update_entry(entry, data=new_data)  # no-op if unchanged
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Zephyr Hood from a config entry."""
@@ -125,22 +146,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await hass.async_add_executor_job(cloud.authenticate)
     except ZephyrAuthError as err:
+        _LOGGER.error("Zephyr sign-in rejected, reauthentication required: %s", err)
         raise ConfigEntryAuthFailed(str(err)) from err
     except ZephyrApiError as err:
         raise ConfigEntryNotReady(str(err)) from err
 
-    # Once we have a working refresh token, persist that instead of the
-    # plaintext password (migrates existing entries that predate this).
-    if cloud.refresh_token and (
-        entry.data.get(CONF_REFRESH_TOKEN) != cloud.refresh_token
-        or entry.data.get(CONF_COGNITO_USERNAME) != cloud.cognito_username
-        or CONF_PASSWORD in entry.data
-    ):
-        new_data = {k: v for k, v in entry.data.items() if k != CONF_PASSWORD}
-        new_data[CONF_REFRESH_TOKEN] = cloud.refresh_token
-        if cloud.cognito_username:
-            new_data[CONF_COGNITO_USERNAME] = cloud.cognito_username
-        hass.config_entries.async_update_entry(entry, data=new_data)
+    # Covers a password fallback during this sign-in (the cloud's callback
+    # isn't wired up until connect()).
+    _async_persist_tokens(hass, entry, cloud)
 
     try:
         devices = await hass.async_add_executor_job(cloud.get_devices)
@@ -174,6 +187,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinator.on_connection_health,
             coordinator.on_auth_failed,
             coordinator.on_command_failed,
+            coordinator.on_tokens_changed,
         )
     except ZephyrApiError as err:
         raise ConfigEntryNotReady(f"MQTT connect failed: {err}") from err
